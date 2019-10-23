@@ -41,6 +41,7 @@
  *   - Freeze VA->PA page mappings till DMA is completed (esp. for ucbdma)
  * *MINOR*
  *   - Replace all CBDMA_* constants with IOAT_*
+ *   	actually, remove many of them.   they bake in the assumption of chan0
  *   - Initializes only the first found CBDMA device
  */
 
@@ -111,7 +112,9 @@ static struct dirtab cbdmadir[] = {
 	{"iommu",     {Qcbdmaiommu, 0, QTFILE}, 0, 0755},
 };
 
-/* Descriptor structue as defined in the programmer's guide.
+
+// XXX rename the structs (desc and channel)
+/* Descriptor structure as defined in the programmer's guide.
  * It describes a single DMA transfer
  */
 struct desc {
@@ -120,32 +123,24 @@ struct desc {
 	uint64_t  src_addr;
 	uint64_t  dest_addr;
 	uint64_t  next_desc_addr;
-	uint64_t  next_source_address;
-	uint64_t  next_destination_address;
-	uint64_t  reserved0;
-	uint64_t  reserved1;
+	uint64_t  next_source_address; // rsv1 linux
+	uint64_t  next_destination_address; // rsv2 linux
+	uint64_t  reserved0; //user1 linux
+	uint64_t  reserved1; //user2 linux
 } __attribute__((packed));
 
 /* The channels are indexed starting from 0 */
-static struct channel {
+// XXX indexed by whom?  i think this was his old comment
+// 	device reports nr chans
+struct channel {
 	uint8_t                number; // channel number
-	struct desc            *pdesc; // desc ptr
+	struct desc            *pdesc; // desc ptr  XXX BAD NAME
 	int                    ndesc;  // num. of desc
 	uint64_t               *status; // reg: CHANSTS, needs to be 64B aligned
 	uint8_t                ver;    // reg: CBVER
+};
 
-/* DEPRECATED */
-/* MMIO address space; from Intel Xeon E7 2800/4800/8800 Datasheet Vol. 2
- * Every channel 0x80 bytes in size.
- */
-	uint8_t  chancmd;
-	uint8_t  xrefcap;
-	uint16_t chanctrl;
-	uint16_t dmacount;
-	uint32_t chanerr;
-	uint64_t chansts;
-	uint64_t chainaddr;
-} cbdmadev, channel0;
+static struct channel channel0;
 
 #define KTEST_SIZE 64
 static struct {
@@ -160,6 +155,8 @@ static struct {
 struct ucbdma {
 	struct desc desc;
 	uint64_t    status;
+	// XXX what is this for?  if they are giving us more than one, why are
+	// they even giving us the desc struct (vs pointer)?
 	uint16_t    ndesc;
 };
 
@@ -170,7 +167,7 @@ void toggle_cbdma_break_loop(void)
 	printk("cbdma: cbdma_break_loop = %d\n", cbdma_break_loop);
 }
 
-/* Function definitions start here */
+// XXX not a huge fan of these - have a single bool.  
 static inline bool is_initialized(void)
 {
 	if (!pci || !mmio)
@@ -293,6 +290,7 @@ static void init_desc(struct channel *c, int ndesc)
 	c->ndesc = ndesc;
 
 	/* allocate pages for descriptors, last 6-bits must be zero */
+		// XXX why pages though?
 	if (!c->pdesc)
 		c->pdesc = kpage_zalloc_addr();
 
@@ -392,6 +390,7 @@ static inline void wait_for_dma_completion(uint64_t *cmpsts)
  */
 static void cbdma_ktest(void)
 {
+	// XXX static!  oh, it's a pointer too, and set later...
 	static struct desc *d;
 	uint64_t value;
 	struct channel *c = &channel0;
@@ -402,6 +401,7 @@ static void cbdma_ktest(void)
 	ktest.src[KTEST_SIZE-1] = '\0';
 	ktest.dst[KTEST_SIZE-1] = '\0';
 
+	// XXX off by one when you look at the stats.  
 	/* for subsequent ktests */
 	ktest.srcfill += 1;
 
@@ -863,9 +863,6 @@ void cbdmainit(void)
 	mmio            = NULL;
 	mmio_sz         = -1;
 
-	/* initialize cbdmadev */
-	memset(&cbdmadev, 0x0, sizeof(cbdmadev));
-
 	/* search for the device 00:04.0 */
 	STAILQ_FOREACH(pci_iter, &pci_devices, all_dev) {
 		id = pci_iter->dev_id << 16 | pci_iter->ven_id;
@@ -892,6 +889,7 @@ void cbdmainit(void)
 	for (i = 0; i < COUNT_OF(pci->bar); i++) {
 		if (pci->bar[i].mmio_sz == 0)
 			continue;
+		// XXX wrong bar?  (0 vs i)
 		mmio_phy = (pci->bar[0].mmio_base32
 			 ? pci->bar[0].mmio_base32
 			 : pci->bar[0].mmio_base64);

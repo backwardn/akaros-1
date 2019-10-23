@@ -34,6 +34,8 @@
 #define BUFFERSZ 8192
 
 struct dev iommudevtab;
+
+// XXX static?
 struct iommu_list_tq iommu_list = TAILQ_HEAD_INITIALIZER(iommu_list);
 static bool is_initialized; /* to detect absence of IOMMU */
 
@@ -44,6 +46,7 @@ enum {
 	Qadddev      = 2,
 	Qremovedev   = 3,
 	Qinfo        = 4,
+	// XXX  this doesn't work either...
 	Qpower       = 5,
 };
 
@@ -56,6 +59,7 @@ static struct dirtab iommudir[] = {
 	{"power",               {Qpower, 0, QTFILE}, 0, 0755},
 };
 
+// XXX might be?
 /* this is might be necessary when updating mapping structures: context-cache,
  * IOTLB or IEC. */
 static inline void write_buffer_flush(struct iommu *iommu)
@@ -75,12 +79,25 @@ static inline void write_buffer_flush(struct iommu *iommu)
 }
 
 /* this is necessary when caching mode is supported.
+ *
+ * XXX assumes? 
+ * 	sounds like a synchronization thing, since we spin on status
+ * 	also, how to do a global shootdown?  (can we just do that?)
+ * 	this is not the queue invalidation stuff
+ * 	also, iotlb vs context cache
+ * 		context-cache entries are the cr3
+ * 		what is the 'IPT entry changed' command?
+ *
+ * 	also, we need to inval all IOMMUs for each process
+ * 		can do p->dev->iommu, but it'll hit each IOMMU multiple times
+ *
  * ASSUMES: No pending flush requests. This is a problem only if other function
  * is used to perform the flush. */
 static inline void iotlb_flush(struct iommu *iommu, uint16_t did)
 {
 	uint64_t cmd, status;
 
+	// XXX style
 	cmd = 0x0
 	| DMA_TLB_IVT        /* issue the flush command */
 	| DMA_TLB_DSI_FLUSH  /* DID specific shootdown */
@@ -107,6 +124,7 @@ static inline struct context_entry *get_context_entry(physaddr_t paddr)
 }
 
 /* iommu is not modified by this function or its callees. */
+// XXX not used either?
 static physaddr_t ct_init(struct iommu *iommu, uint16_t did)
 {
 	struct context_entry *cte;
@@ -149,6 +167,7 @@ static physaddr_t rt_init(struct iommu *iommu, uint16_t did)
 		rte->lo = 0
 			| ct
 			| (0x1 << RT_LO_PRESENT_SHIFT);
+		// XXX shitty macros
 	}
 
 	return rt;
@@ -209,6 +228,8 @@ static void teardown_page_tables(struct proc *p, struct pci_device *d)
 
 	/* Mark the entry as not present */
 	cte->lo &= ~0x1;
+	// XXX might only need to do this if RWBF cap is 1 (Sec 6.8)
+	// 	same goes for making an entry present, after we set lo
 	write_buffer_flush(iommu);
 	iotlb_flush(iommu, p->pid);
 
@@ -296,13 +317,16 @@ void iommu_disable(void)
 		_iommu_disable(iommu);
 }
 
+// XXX wtf is this?
 static bool _iommu_status(struct iommu *iommu)
 {
 	uint32_t status = 0;
 
+	// XXX what does this protect?
 	spin_lock_irqsave(&iommu->iommu_lock);
 
-	/* read status */
+	// XXX meaningless comment
+	/* read status */ 
 	status = read32(iommu->regio + DMAR_GSTS_REG);
 
 	spin_unlock_irqsave(&iommu->iommu_lock);
@@ -321,6 +345,7 @@ bool iommu_status(void)
 	return false;
 }
 
+// XXX gut
 /* Helpers for set/get/init PCI device (BDF) <=> Process map */
 static bool proc_already_in_iommu_list(struct iommu *iommu, struct proc *p)
 {
@@ -436,6 +461,7 @@ void iommu_process_cleanup(struct proc *p)
 		unassign_device(pcidev->bus, pcidev->dev, pcidev->func);
 }
 
+// XXX user pointer, parsecmd, \n
 static int write_add_dev(char *va, size_t n)
 {
 	int bus, dev, func, err;
@@ -475,6 +501,8 @@ static int write_power(char *va, size_t n)
 {
 	int err;
 
+	// XXX strcmp, but what if size < n?
+	// XXX use parsecmd
 	if (!strcmp(va, "enable") || !strcmp(va, "on")) {
 		iommu_enable();
 		return n;
@@ -482,7 +510,7 @@ static int write_power(char *va, size_t n)
 		iommu_disable();
 		return n;
 	} else
-		return n;
+		return n;// XXX error?
 }
 
 static void _open_mappings(struct sized_alloc *sza, struct proc *proc)
@@ -505,6 +533,7 @@ static struct sized_alloc *open_mappings(void)
 	TAILQ_FOREACH(iommu, &iommu_list, iommu_link) {
 		spin_lock_irqsave(&iommu->iommu_lock);
 
+		// XXX break this procs link
 		sza_printf(sza, "Mappings for iommu@%p\n", iommu);
 		if (TAILQ_EMPTY(&iommu->procs))
 			sza_printf(sza, "\t<empty>\n");
@@ -731,6 +760,7 @@ static size_t iommuwrite(struct chan *c, void *va, size_t n, off64_t offset)
 		err = write_remove_dev(va, n);
 		break;
 	case Qpower:
+		// XXX no check for supported?
 		err = write_power(va, n);
 		break;
 	case Qmappings:
@@ -824,12 +854,36 @@ static void iommu_assert_all(void)
 static void iommu_populate_fields(void)
 {
 	struct iommu *iommu;
+        uint64_t cap, ecap;
 
-	TAILQ_FOREACH(iommu, &iommu_list, iommu_link)
+	TAILQ_FOREACH(iommu, &iommu_list, iommu_link) {
 		iommu->roottable = rt_init(iommu, IOMMU_DID_DEFAULT);
+
+                cap = read64(iommu->regio + DMAR_CAP_REG);
+                ecap = read64(iommu->regio + DMAR_ECAP_REG);
+
+                iommu->roottable = rt_init(iommu, IOMMU_DID_DEFAULT);
+                iommu->iotlb_cmd_offset = ecap_iotlb_offset(ecap) + 8;
+                iommu->iotlb_addr_offset = ecap_iotlb_offset(ecap);
+
+		// XXX style
+                if (cap_rwbf(cap))
+                        iommu->rwbf = true;
+                else
+                        iommu->rwbf = false;
+
+		// XXX style
+                if (ecap_dev_iotlb_support(ecap))
+                        iommu->device_iotlb = true;
+		else
+                        iommu->device_iotlb = false;
+
+        }
 }
 
 /* Run this function after all individual IOMMUs are initialized. */
+// XXX is this called more than once?
+// 	do we need this?  can be done on the fly with each one?
 void iommu_initialize_global(void)
 {
 	if (!is_initialized)
@@ -842,6 +896,8 @@ void iommu_initialize_global(void)
 	iommu_enable();
 }
 
+// XXX probably set a global - this never changes...
+// 	worth returning a char *reason?
 /* should only be called after all iommus are initialized */
 bool iommu_supported(void)
 {
@@ -859,6 +915,7 @@ bool iommu_supported(void)
 }
 
 /* grabs the iommu of the first DRHD with INCLUDE_PCI_ALL */
+	// XXX can there be more than one?
 struct iommu *get_default_iommu(void)
 {
 	struct Dmar *dt;
@@ -891,11 +948,13 @@ void iommu_map_pci_devices(void)
 	STAILQ_FOREACH(pci_iter, &pci_devices, all_dev)
 		pci_iter->iommu = iommu;
 
+	// XXX
 	// TODO: parse devscope and assign scoped iommus
 }
 
 /* This is called from acpi.c to initialize struct iommu.
  * The actual IOMMU hardware is not touch or configured in any way. */
+	// XXX why not?  or change the name
 void iommu_initialize(struct iommu *iommu, uint8_t haw, uint64_t rba)
 {
 	is_initialized = true;
@@ -905,6 +964,7 @@ void iommu_initialize(struct iommu *iommu, uint8_t haw, uint64_t rba)
 	spinlock_init_irqsave(&iommu->iommu_lock);
 	iommu->rba = rba;
 	iommu->regio = (void __iomem *) vmap_pmem_nocache(rba, VTD_PAGE_SIZE);
+	// XXX why not run it then?  or false initially?
 	iommu->supported = true; /* this gets updated by iommu_supported() */
 	iommu->num_assigned_devs = 0;
 	iommu->haw_dmar = haw;

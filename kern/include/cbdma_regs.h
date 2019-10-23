@@ -259,6 +259,8 @@ void cbdma_reset_device(void);
 #define CBDMA_CHAINADDR_OFFSET				0x90
 #define CBDMA_CHANCMP_OFFSET				0x98
 #define CBDMA_CHANERR_OFFSET				0xa8
+
+// XXX these might be OK
 #define CBDMA_DESC_CTRL_INTR_ON_COMPLETION		0x01 /* 32-bit field */
 #define CBDMA_DESC_CTRL_WRITE_CHANCMP_ON_COMPLETION	0x08
 #define CBDMA_DESC_CTRL_NULL_DESC			0x20
