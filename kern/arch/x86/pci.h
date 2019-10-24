@@ -9,6 +9,7 @@
 #include <ros/common.h>
 #include <sys/queue.h>
 #include <atomic.h>
+#include <kthread.h>
 #include <arch/pci_regs.h>
 
 #define pci_debug(...)  printk(__VA_ARGS__)
@@ -167,16 +168,50 @@ struct pci_bar {
 	void				*mmio_kva;
 };
 
+/* Half-baked and optional PCI ops.  These are purposefully not Linux's
+ * pci_driver, since our driver init is different.  For now.  Our drivers all
+ * scan the PCI list looking for their devices.  Some do it in init_func_3
+ * (IOAT).  The NICs do it by devether with its pnp registration mechanism.
+ *
+ * So most devices still auto-init themselves, around the same time that they
+ * post their pci_ops (if they support runtime reset & init).  Then later, we
+ * can reset the device, then init again.  So the usual pattern is Boot ->
+ * {Reset -> Init}*.  And only take the next step if {reset,init} returned true
+ * and changed our state.  Now this is up to the driver - drivers don't have to
+ * pre-init.  They can leave it in a reset state if they want.
+ *
+ * And only make these transitions with one caller at a time, particularly after
+ * boot.  These drivers are no set up for concurrent changes.  YMMV.
+ *
+ * Bus mastering needs some thought.  All PCI devices currently manage this on
+ * their own.  Probe is done on their own too - PCI doesn't call a device probe
+ * method, so we don't know it failed, and thus don't know to clear BME.
+ */
+struct pci_device;
+struct pci_ops {
+	const char *driver_name;
+	bool (*init)(struct pci_device *);
+	bool (*reset)(struct pci_device *);
+};
+
+enum {
+	PCI_STATE_UNKNOWN = 0,
+	PCI_STATE_RESET = 1,
+	PCI_STATE_INIT = 2,
+};
+
 struct pci_device {
 	STAILQ_ENTRY(pci_device)	all_dev; /* list of all devices */
 	SLIST_ENTRY(pci_device)		irq_dev; /* list of all devs on irq */
 	char				name[9];
 	spinlock_t			lock;
+	qlock_t				qlock;
+	struct pci_ops			*_ops;	/* don't access directly */
+	int				state;
 	uintptr_t			mmio_cfg;
 	void				*dev_data; /* device private pointer */
 	struct iommu			*iommu; /* ptr to controlling iommu */
 	struct device			linux_dev;
-	bool				in_use;	/* prevent double discovery */
 	int				domain; /* legacy size was 16-bits */
 	uint8_t				bus;
 	uint8_t				dev;
@@ -271,6 +306,10 @@ void pci_clear_mwi(struct pci_device *dev);
 static inline void pci_set_drvdata(struct pci_device *pcidev, void *data);
 static inline void *pci_get_drvdata(struct pci_device *pcidev);
 static inline void *pci_get_mmio_bar_kva(struct pci_device *pdev, int bar);
+static inline void pci_set_ops(struct pci_device *pdev, struct pci_ops *ops,
+			       int pci_state);
+void pci_reset_device(struct pci_device *pdev);
+void pci_init_device(struct pci_device *pdev);
 
 /* MSI functions, msi.c */
 int pci_msi_enable(struct pci_device *p, uint64_t vec);
@@ -303,4 +342,13 @@ static inline void *pci_get_drvdata(struct pci_device *pcidev)
 static inline void *pci_get_mmio_bar_kva(struct pci_device *pdev, int bir)
 {
 	return pdev->bar[bir].mmio_kva;
+}
+
+/* The helper is to make sure the driver tells us the initial state */
+static inline void pci_set_ops(struct pci_device *pdev, struct pci_ops *ops,
+			       int pci_state)
+{
+	pdev->_ops = ops;
+	assert(pdev->state == PCI_STATE_UNKNOWN);
+	pdev->state = pci_state;
 }

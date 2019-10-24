@@ -54,6 +54,15 @@
  * xalloc, and maybe more flexibility. */
 struct dma_arena dma_phys_pages;
 
+struct dma_arena *dev_to_dma_arena(struct device *d)
+{
+	struct pci_device *pdev = container_of(d, struct pci_device, linux_dev);
+
+	if (pdev->proc_owner)
+		return pdev->proc_owner->user_pages;
+	return &dma_phys_pages;
+}
+
 static void *dma_phys_a(struct arena *a, size_t amt, int flags)
 {
 	return (void*)PADDR(arena_alloc(a, amt, flags));
@@ -147,7 +156,7 @@ struct dma_pool {
 	struct dma_arena	*source;
 };
 
-struct dma_pool *dma_pool_create(const char *name, void *dev,
+struct dma_pool *dma_pool_create(const char *name, struct device *dev,
 				 size_t size, size_t align, size_t boundary)
 {
 	struct dma_pool *dp;
@@ -201,4 +210,70 @@ void *dma_pool_zalloc(struct dma_pool *dp, int mem_flags, dma_addr_t *handle)
 void dma_pool_free(struct dma_pool *dp, void *cpu_addr, dma_addr_t addr)
 {
 	kmem_cache_free(&dp->kc, (void*)addr);
+}
+
+// XXX
+#include <process.h>
+#include <mm.h>
+#include <umem.h>
+
+static void *user_pages_a(struct arena *a, size_t amt, int flags)
+{
+	struct dma_arena *da = container_of(a, struct dma_arena, arena);
+	struct proc *p = da->data;
+	void *uaddr;
+
+	uaddr = mmap(p, 0, amt, PROT_READ | PROT_WRITE,
+		     MAP_ANONYMOUS | MAP_POPULATE | MAP_PRIVATE, -1, 0);
+	/* TODO: think about OOM for user dma arenas, and MEM_ flags. */
+	assert(uaddr != MAP_FAILED);
+	return uaddr;
+}
+
+static void user_pages_f(struct arena *a, void *obj, size_t amt)
+{
+	struct dma_arena *da = container_of(a, struct dma_arena, arena);
+	struct proc *p = da->data;
+
+	munmap(p, (uintptr_t)obj, amt);
+}
+
+static void *user_addr_to_kaddr(struct dma_arena *da, physaddr_t uaddr)
+{
+	/* Our caller needs to be running in the user's address space.  We
+	 * either need to pin the pages or handle page faults.  We could use
+	 * uva2kva(), but that only works for single pages.  Handling contiguous
+	 * pages would require mmapping a KVA-contig chunk or other acrobatics.
+	 */
+	return (void*)uaddr;
+}
+
+void add_dma_arena(struct proc *p)
+{
+	struct dma_arena *da = kzmalloc(sizeof(struct dma_arena), MEM_WAIT);
+	char name[32];
+
+	snprintf(name, ARRAY_SIZE(name), "proc-%d", p->pid);
+
+	__arena_create(&da->arena, name, PGSIZE,
+		       user_pages_a, user_pages_f, ARENA_SELF_SOURCE, 0);
+
+	// XXX uvpt->kpt?  pass-through for IOMMU?
+	da->to_cpu_addr = user_addr_to_kaddr;
+	da->data = p;
+
+	// XXX locking!
+	p->user_pages = da;
+}
+
+void del_dma_arena(struct proc *p)
+{
+	struct dma_arena *da;
+
+	// XXX locking!
+	da = p->user_pages;
+	p->user_pages = NULL;
+
+	__arena_destroy(&da->arena);
+	kfree(da);
 }

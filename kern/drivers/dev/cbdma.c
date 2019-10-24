@@ -58,6 +58,8 @@
 #include <cbdma_regs.h>
 #include <arch/pci_regs.h>
 
+#include <linux/dmaengine.h>
+
 #define NDESC 1 // initialize these many descs
 #define BUFFERSZ 8192
 
@@ -168,9 +170,9 @@ void toggle_cbdma_break_loop(void)
 // XXX not a huge fan of these - have a single bool.  
 static inline bool is_initialized(void)
 {
-	if (!pci || !mmio)
-		return false;
-	else
+//	if (!pci || !mmio)
+//		return false;
+//	else
 		return true;
 }
 
@@ -386,6 +388,255 @@ static inline void wait_for_dma_completion(uint64_t *cmpsts)
  - Initiate the transfer
  - Prints results
  */
+static inline struct pci_device *dma_chan_to_pci_dev(struct dma_chan *dc)
+{
+	return container_of(dc->device->dev, struct pci_device, linux_dev);
+}
+
+/* Filter function for finding a particular PCI device.  If
+ * __dma_request_channel() asks for a particular device, we'll only give it that
+ * chan.  If you don't care, pass NULL, and you'll get any free chan. */
+// XXX: can they get multiple channels on the same function, and then
+// accidentally get a channel behind a process's IOMMU?
+static bool filter_pci_dev(struct dma_chan *dc, void *arg)
+{
+	struct pci_device *pdev = dma_chan_to_pci_dev(dc);
+
+	if (arg)
+		return arg == pdev;
+	return true;
+}
+
+/* Addresses are device-physical.  pdev can be NULL if you don't care which
+ * device to use. */
+static int issue_dma(struct pci_device *pdev, physaddr_t dst, physaddr_t src,
+		     size_t len)
+{
+	struct dma_chan *dc;
+	dma_cap_mask_t mask;
+	struct dma_async_tx_descriptor *tx;
+	int flags;
+
+	/* dmaengine_get works for the non-DMA_PRIVATE devices.  A lot
+	 * of devices turn on DMA_PRIVATE, in which case they won't be in the
+	 * general pool available to the dmaengine.  Instead, we directly
+	 * request DMA channels - particularly since we want specific devices to
+	 * use with the IOMMU. */
+
+	dma_cap_zero(mask);
+	dma_cap_set(DMA_MEMCPY, mask);
+	dc = __dma_request_channel(&mask, filter_pci_dev, pdev);
+	if (!dc) {
+		// XXX printk->set_error, or waserror
+		printk("Couldn't find chan!\n");
+		return -1;
+	}
+
+	// XXX try IRQs too.  this is the polling version
+	flags = 0; //DMA_PREP_INTERRUPT;
+
+	if (!is_dma_copy_aligned(dc->device, dst, src, len)) {
+		printk("Bad copy alignment: %p %p %lu\n", dst, src, len);
+		dma_release_channel(dc);
+		return -1;
+	}
+	tx = dc->device->device_prep_dma_memcpy(dc, dst, src, len, flags);
+	if (!tx) {
+		printk("Couldn't tx!\n");
+		dma_release_channel(dc);
+		return -1;
+	}
+	// XXX the async / interrupt / wakeup style in linux
+	//struct completion cmp;
+//	async_tx_ack(tx);
+//	init_completion(&cmp);
+//	tx->callback = ioat_dma_test_callback;
+//	tx->callback_param = &cmp;
+	dma_cookie_t cookie;
+
+	cookie = dmaengine_submit(tx);
+	if (cookie < 0) {
+		printk("Couldn't cookie!\n");
+		/* I think the tx is cleaned up by release_channel - the driver
+		 * maintains it. */
+			// XXX grep ioat_alloc_ring_ent
+		dma_release_channel(dc);
+		return -1;
+	}
+	// i think you can poke this.  wait_for_async does this too
+	// need to do it for the async version
+	dma_async_issue_pending(dc);
+
+	//tmo = wait_for_completion_timeout(&cmp, msecs_to_jiffies(3000));
+	//etc...  is this an internal interface?  (sanity check it is really
+	//	XXX should be dmaengine_tx_status?
+	//		this is just dc->device->device_tx_stats
+	//	or dma_async_is_tx_complete (slightly more)
+	//		this is the func, plus some last/used pointer shit
+	//		some pairing with dma_async_is_complete
+	//done)
+//	if (tmo == 0) { 
+//	    dma->device_tx_status(dma_chan, cookie, NULL)
+//					!= DMA_COMPLETE) {
+
+//	dma_sync_wait: async_issue_opending, spinwait until status is compl
+//		takes a chan and cookie
+//	dma_wait_for_async_tx: takes a tx.  spins on tx->cookie == -EBUSY, then
+//		calls dma_sync_wait, (tx has chan and cookie)
+	dma_wait_for_async_tx(tx);
+
+	dma_release_channel(dc);
+
+	// XXX fuck.  we can use user addrs for the targets, maybe, but the
+	// descriptor is in kernel space, and so is the status.
+	// 	need to weasel our way in there...
+	// 	maybe dma_map?
+	// 		the only dma_map calls are to src/dest
+	// he was passing user pointers for the descriptor and status locations,
+	// and was spinning in kernel space on the (unpinned!) kaddr
+	// 	(the aliased door)
+	// 	ioat_issue_pending(ioat_chan)
+	// 		checks ring_pending.  that's the driver looking.
+	// 		when does the device get told the desc addr?
+	// 			can look for reg_base
+	// 		ultimately writes dmacount.
+	// 	the stuff was submitted earlier
+	// 		ioat_chan->descs[chunk].hw might be phys addrs
+	// 		gets put in tx->phys (ioat desc->txd.phys)
+	// 		
+	// 		looks like all descriptors were made early on
+	// 			this is a problem.  userspace wants us to have
+	// 			our own.  they are only in kernel memory, so
+	// 			there is no userspace address IOVA that works
+	// 			for the descriptors
+	// 			- what if they mmap the phys space?
+	// 			then when we have any dma_addr_t, we convert to
+	// 			userspace addr in the code?
+	// 				- this way, we have 3 mappings:
+	// 					kaddr virt: for us
+	// 					paddr: for no-IOMMU
+	// 					uaddr (IOMMU)
+	// 				- need to worry about in-flight ops?
+	// 				need to be completely done before we
+	// 				return to the kernel.  some big reset
+	// 				hammer?
+	// 					basically, anything the device
+	// 					could write (control plane!) is
+	// 					now R/W user.  (which it was
+	// 					when they DMA'd too)
+	// 			can we do this during async_tx_desc init?
+	// 				no - too soon.
+	// 		look for ioat_set_chainaddr(ioat_chan, desc->txd.phys)
+	// 			(the descriptor (in a chain))
+	// 		interpose on all dma_map_* ops?
+	// 			if we can reset and rebuild the driver
+	// 			repeatedly, per BDF, then maybe we could
+	// 			tear down, hand to process, initialize driver,
+	// 			complete process, reset driver, tear down
+	// 			mappings, free proc IPT
+	//
+	// 			dma_map_page
+	// 			dma_map_single
+	// 				used for src/dst
+	//
+	// 			ioat_chan->completion = dma_pool_zalloc
+	// 				and &completion_dma
+	// 				via ioat_alloc_chan_resources
+	// 					which is during chan_get
+	// 				('completion' is the pool / slab)
+	// 					created during ioat_probe
+	// 						so right before
+	// 						registration
+	// 						via ioat_init
+	// 				these are the aligned completion
+	// 				locations, right?
+	// 			ioat3_alloc_sed
+	// 				super extended HW desc
+	// 					hw
+	// 					dma <---- this
+	// 					parent
+	// 					hw_pool
+	// 				comes from ioat_dma->sed_hw_pool
+	// 				called via prep_pq (one of the prep ops
+	// 				that returns a tx desc)
+	//
+	// 	does the unmap_data do anything?
+	// 		it's a bulk unmapper helper.  hang it off your tx, and
+	// 		when the tx is done, it'll call dma_unmap_page on all
+	// 		pages
+	// 		- not sure this helps my main problem.
+	//
+	// 	we also have a tx-done callback
+	//
+	// 	the thing that made me think of the arenas was the pool alloc.
+	// 	it looks like it should be an arena anyway.  for the desc chunk,
+	// 	it's a static blob, which we could have a one-time, driver
+	// 	specific "add this offset to get the UVA".  to do that for the
+	// 	pool, we'd need contig phys mem, and then know the offset, and
+	// 	know the size in advance.
+	// 		- not knowing the size in advance is the big thing
+	//
+	//
+	// k, idea:
+	// - deregister/reset/uninit the device.  (or never use it)
+	// 	XXX simple thing: can we do this repeatedly?
+	// 		(need some guard to make sure it's not done multiple
+	// 		times, raced on, etc)
+	// - "give it" to a process: various IOMMU assignments.  after this
+	// point, all "device phys" memory is userspace addresses, going through
+	// the IOMMU.  
+	// - when the process exits, we reset the device completely, then maybe
+	// see if any dma allocs are still out there.  then its safe to tear
+	// down user.  something like:
+	// 	process
+	// 		IOMMU
+	// 			PCIDEV init
+	// 				OPS
+	// 					proc destroy!
+	// 				OPS-done
+	// 			PCIDEV reset
+	// 		IOMMU teardown / etc
+	// 	__proc_free
+	// - change all of its DMA accessors to go through another layer.
+	// particularly:
+	// 	dma_map_ (src/dst stuff) needs to be user addresses.  which it
+	// 	already is?  (so... no change?)
+	// 	dma_pool_zalloc
+	// 	dma_alloc_coherent (returns kernel virtual and user physical)
+	//
+	// 	probably build all of them on a similar arena
+	//
+	// we have that dev pointer, which can lead us to pci_device, which can
+	// lead us to the process to use.
+	// 	have a DMA arena attached to the pci devices
+	//
+	// issue:
+	// 	kernel code needs the KVA for this.  or SOME VA for this.  UVA?
+	// 	are we running the kernel in the user's address space?  
+	// 		i.e. via a 'reset/init' syscall?
+	// 		maybe run it only in user's addr space
+	// 		IRQs/tasklets etc - don't touch any of these addresses!
+	// 			dangerous!  or need to stay in the proc's addr
+	// 			space (nest RKMs with switch_to, switch_back)
+	//
+	// 	need to keep these pages pinned?  faulted?
+	// 		IOMMU shootdown if we unmap
+	// 		prefault, for devices that can't fail
+	// 		is the user allowed (albeit buggy) to munmap?
+	//
+	// where does the memory come from?  userspace needs to give it to the
+	// device allocator somehow.
+	// 	some ctl, calls add_segment
+	// 		how much do we need in advance?
+	// 	an auto-mmap arena, like with UCQs?
+	// 		- can userspace munmap it?  or some MAP_KERNEL flag?
+	// 		- this one seems like it is kernel managed
+	// 		- with UCQs, userspace was doing the munmap, since it
+	// 		knew when it was done, so that is different
+	//
+	return 0;
+}
+
 static void cbdma_ktest(void)
 {
 	// XXX static!  oh, it's a pointer too, and set later...
@@ -402,6 +653,112 @@ static void cbdma_ktest(void)
 	// XXX off by one when you look at the stats.  
 	/* for subsequent ktests */
 	ktest.srcfill += 1;
+
+
+/*
+
+	dmaengine_get_unmap_data
+	maybe set flags DMA_PREP_INTERRUPT DMA_PREP_FENCE
+
+	// prep the unmap struct
+	// 	this might be just dma mapping and bookkeeping
+	unmap->to_cnt = 1;
+	unmap->addr[0] = dma_map_page(device->dev, src, src_offset, len
+	unmap->from_cnt = 1;
+	unmap->addr[1] = dma_map_page(device->dev, dest
+	unmap->len = len; 
+	// looks like the actual memcpy?  or just prep.  either way, does the
+	// unmap struct matter, since they are passing the fields?
+	tx = device->device_prep_dma_memcpy(chan, unmap->addr[1], etc
+
+	dma_set_unmap(tx, unmap);
+
+	tx->callback = submit->cb_fn;
+	tx->callback_param = submit->cb_param;
+
+	dmaengine_unmap_put(unmap);
+
+	returns a dma_async_tx_descriptor 
+
+	supposed to check dma_has_cap(DMA_INTERRUPT, device->cap_mask)
+			actually, this is a dummy periodic interrupt to check on
+			the status or something...
+		else poll
+	tx = device ? device->device_prep_dma_interrupt(chan, 0) : NULL;
+	async_tx_submit(chan, tx, submit)
+		poll
+			async_tx_quiesce(&submit->depend_tx);
+			async_tx_sync_epilog(submit);    
+
+	sync_wait, wait_for.  what's the diff?
+	see around dma_async_tx_callback and dmaengine_tx_result
+
+	DMA_CTRL_REUSE  - client can reuse desc til freed/clear
+
+	
+
+dmaengine_get(); (and put)
+
+dma_async_tx_descriptor_init(tx, chan)
+	sets tx->chan and inits the spinlock
+	this is called by IOAT, not sure the client needs it
+
+xact type: DMA_MEMCPY, DMA_MEMSET
+various ack funcs on tx, (set,clear,test)
+	async_tx_ack(struct dma_async_tx_descriptor *tx)
+
+capability set,clear,zero,check on tx dma_has_cap(tx
+
+dma_async_issue_pending on a chan
+	batch up a bunch, and then push all of them at once
+dma_async_is_tx_complete - poll for transaction completion
+	this took a cookie, not a TX
+dma_async_is_complete - test a cookie against chan state
+	related, some batching stuff.  a single cookie can be compared against
+	known completed ones.  implying there's an ordering of dma_cookie_t vals
+dma_set_tx_state
+	this fills in a dma_tx_state with the last/used/residue vals.  maybe
+	similar to the above 'complete' checkers
+tx desc set/clear/test REUSE
+dmaengine_desc_free(tx).  guess we're done with it.  though it can return EPERM?
+
+
+struct dma_chan *dma_find_channel(enum dma_transaction_type tx_type);
+enum dma_status dma_sync_wait(struct dma_chan *chan, dma_cookie_t cookie);
+enum dma_status dma_wait_for_async_tx(struct dma_async_tx_descriptor *tx);
+void dma_issue_pending_all(void);
+struct dma_chan *__dma_request_channel(const dma_cap_mask_t *mask,
+					dma_filter_fn fn, void *fn_param);
+struct dma_chan *dma_request_slave_channel(struct device *dev, const char *name);
+
+struct dma_chan *dma_request_chan(struct device *dev, const char *name);
+struct dma_chan *dma_request_chan_by_mask(const dma_cap_mask_t *mask);
+
+void dma_release_channel(struct dma_chan *chan);
+int dma_get_slave_caps(struct dma_chan *chan, struct dma_slave_caps *caps);
+
+dma_cookie_assign
+	dma_cookie_complete
+	dmaengine_desc_get_callback
+
+dmaengine_submit(tx)
+	someone does this
+
+note you poll on chan + cookie, not tx
+
+*/
+
+
+	//XXX
+	//dma_src = dma_map_single(dev, src, IOAT_TEST_SIZE, DMA_TO_DEVICE);
+
+	issue_dma(pci_match_tbdf(MKBUS(0, 0, 4, 3)),
+		  PADDR(ktest.dst), PADDR(ktest.src), KTEST_SIZE);
+
+	return;
+
+
+
 
 	/* preparing descriptors */
 	d = channel0.pdesc;
@@ -591,18 +948,36 @@ static struct sized_alloc *open_stats(void)
 
 static struct sized_alloc *open_reset(void)
 {
-	struct sized_alloc *sza = sized_kzmalloc(BUFFERSZ, MEM_WAIT);
+	struct sized_alloc *sza;
+	// XXX
+	struct pci_device *pdev = pci_match_tbdf(MKBUS(0, 0, 4, 3));
 
-	if (cbdma_is_reset_pending())
-		sza_printf(sza, "Status: Reset is pending\n");
-	else
-		sza_printf(sza, "Status: No pending reset\n");
+	if (!pdev)
+		error(EINVAL, "No device 0:4.3");
+	if (!pdev->_ops)
+		error(EINVAL, "No ops on device 0:4.3");
 
-	sza_printf(sza, "Write '1' to perform reset!\n");
+	// XXX some sync/protection.  maybe in the pci dev.  qlock.  etc.
+	// qlock the device
+	// 	state variable
+
+	pci_reset_device(pdev);
+	pci_init_device(pdev);
+
+	sza = sized_kzmalloc(BUFFERSZ, MEM_WAIT);
+	sza_printf(sza, "Should have reset, then init, 0:4.3\n");
+
+//	if (cbdma_is_reset_pending())
+//		sza_printf(sza, "Status: Reset is pending\n");
+//	else
+//		sza_printf(sza, "Status: No pending reset\n");
+//
+//	sza_printf(sza, "Write '1' to perform reset!\n");
 
 	return sza;
 }
 
+// XXX overkill for a one-liner
 static struct sized_alloc *open_iommu(void)
 {
 	struct sized_alloc *sza = sized_kzmalloc(BUFFERSZ, MEM_WAIT);
@@ -621,13 +996,13 @@ static struct sized_alloc *open_ktest(void)
 	/* run the test */
 	cbdma_ktest();
 
-	sza_printf(sza,
-	   "Self-test Intel CBDMA [%x:%x] registered at %02x:%02x.%x\n",
-	   pci->ven_id, pci->dev_id, pci->bus, pci->dev, pci->func);
+//	sza_printf(sza,
+//	   "Self-test Intel CBDMA [%x:%x] registered at %02x:%02x.%x\n",
+//	   pci->ven_id, pci->dev_id, pci->bus, pci->dev, pci->func);
 
-	sza_printf(sza, "\tChannel Status: %s (raw: 0x%x)\n",
-		cbdma_str_chansts(*((uint64_t *)channel0.status)),
-		(*((uint64_t *)channel0.status) & IOAT_CHANSTS_STATUS));
+//	sza_printf(sza, "\tChannel Status: %s (raw: 0x%x)\n",
+//		cbdma_str_chansts(*((uint64_t *)channel0.status)),
+//		(*((uint64_t *)channel0.status) & IOAT_CHANSTS_STATUS));
 
 	sza_printf(sza, "\tCopy Size: %d (0x%x)\n", KTEST_SIZE, KTEST_SIZE);
 	sza_printf(sza, "\tsrcfill: %c (0x%x)\n", ktest.srcfill, ktest.srcfill);
@@ -707,9 +1082,9 @@ bool cbdma_is_reset_pending(void)
 static struct chan *cbdmaopen(struct chan *c, int omode)
 {
 	switch (c->qid.path) {
-	case Qcbdmastats:
-		c->synth_buf = open_stats();
-		break;
+//	case Qcbdmastats:
+//		c->synth_buf = open_stats();
+//		break;
 	case Qcbdmareset:
 		c->synth_buf = open_reset();
 		break;
@@ -732,7 +1107,7 @@ static struct chan *cbdmaopen(struct chan *c, int omode)
 static void cbdmaclose(struct chan *c)
 {
 	switch (c->qid.path) {
-	case Qcbdmastats:
+//	case Qcbdmastats:
 	case Qcbdmareset:
 	case Qcbdmaiommu:
 	case Qcbdmaktest:
@@ -753,7 +1128,7 @@ static size_t cbdmaread(struct chan *c, void *va, size_t n, off64_t offset)
 
 	switch (c->qid.path) {
 	case Qcbdmaktest:
-	case Qcbdmastats:
+	//case Qcbdmastats:
 	case Qcbdmareset:
 	case Qcbdmaiommu:
 		return readstr(offset, va, n, sza->buf);
@@ -800,17 +1175,20 @@ static size_t cbdmawrite(struct chan *c, void *va, size_t n, off64_t offset)
 	case Qdir:
 		error(EPERM, "writing not permitted");
 	case Qcbdmaktest:
-	case Qcbdmastats:
+//	case Qcbdmastats:
 		error(EPERM, ERROR_FIXME);
-	case Qcbdmareset:
-		if (offset == 0 && n > 0 && *(char *)va == '1') {
-			cbdma_reset_device();
-			init_channel(&channel0, 0, NDESC);
-		} else {
-			error(EINVAL, "cannot be empty string");
-		}
-		return n;
+//	case Qcbdmareset:
+//		if (offset == 0 && n > 0 && *(char *)va == '1') {
+//			cbdma_reset_device();
+//			init_channel(&channel0, 0, NDESC);
+//		} else {
+//			error(EINVAL, "cannot be empty string");
+//		}
+//		return n;
 	case Qcbdmaucopy:
+		// XXX XME
+		error(EPERM, ERROR_FIXME);
+		return -1;
 		if (offset == 0 && n > 0) {
 			printk("[kern] value from userspace: %p\n", va);
 			if (iommu_enabled)
@@ -850,6 +1228,10 @@ void cbdmainit(void)
 	int i;
 	int id;
 	struct pci_device *pci_iter;
+
+	/* setup ktest struct */
+	ktest.srcfill = '1';
+	ktest.dstfill = '0';
 
 	printk("cbdma: skipping it\n");
 	return;
@@ -937,3 +1319,105 @@ struct dev cbdmadevtab __devtab = {
 	.remove     = devremove,
 	.wstat      = devwstat,
 };
+
+//  XXX notes from dma.c
+//
+//  also, i still haven't sorted out the "some base arena that creates
+//  its shit from calling a magic function".  dummy arena thing
+//  	this is very easy.  just use the right afcun/ffunc when
+//  	allocating.  maybe add a single dummy arena, everyone can source
+//  	from it with their own afunc/ffunc that does whatever they want.
+//
+//  	what does a user arena source from?
+//  		tempted to call do_mmap(), which just gets us some user
+//  		memory.  
+//
+//  		alternatively: we get phys pages, our afunc pins them
+//  		(we did the alloc, not the do_mmap).
+//
+//  probably don't want to invest too much - is this for anything other
+//  than IOMMU testing with the IOAT?
+//  	- broader uses for a user virtual-addr-backed-by-RAM allocator?
+//  		- is the UVA the arena? (managing VA space, similar to
+//  		radixVM), with phys mem being an 'added on'?
+//  		- isn't that anonymous memory?
+//  			so maybe a UVA arena, and the anon-uva-mem
+//  			sources from UVA, and does its own 'foreach
+//  			kpage' populate.  or o/w attaches to phys mem
+//  		- UVA first, then whatever it is gets linked in second
+//  			- do_mmap does both
+//  		- that 'uva' arena is sort of do_mmap, but with flags
+//  		and shit, plus the page tables, plus other shit...  
+//  		- the backwards thing here is that we need to know what
+//  		to point to when making the mapping.  getting the UVA is
+//  		just one small part.  need the UVA (location) and the
+//  		object (file, memory), and then stitch them together.
+//  	- the intent with this whole fucking thing was to have all linux DMA
+//  	allocs go through some arena/interface, which this sources from.
+//  		- so clearly our arena gives us device-phys addrs, not the
+//  		current shit we have.
+//  			but should that be a usual thing?  or is this IOAT-1-off
+//  		- by definition this is only for the weird split model
+//  	- OK, we're good so far.  the "arena returns physaddr" dance sucks a
+//  	little, if we're not going to use it.
+//  	- the pci_dev->dma_arena seems like a bit much
+//  		we'll have pcidev->proc
+//  		maybe proc->arena, and we use that for other shit?
+//  			that's the pinned permanently UVA with memory?
+//  				or is that a hack?
+//  				if we let them get unmapped from userspace, we
+//  				will unbalance the arena - which thinks the
+//  				stuff is still alloced.
+//  			which doesn't work for UCQs, since userspace unmaps
+//  				- what if the kernel managed all the memory?
+//  				- initial mmaps, intermediate, and detected
+//  				munmaps?  (userspace could build the chain)
+//  				- UCQs are (suggested) to be mmaped in a large
+//  				block, and not a lot of little mmaps
+//  				- initially the idx are both supposed to point
+//  				to a page
+//  				- would need a syscall/alloc to start using the
+//  				UCQ, or some other way to make it work.
+//  				userspace (now) checks it before the kernel
+//  				could have seen it.
+//  					- would require some reworking, not
+//  					undoable.  e.g. !pages == empty.  kernel
+//  					sets it up when it is first used (sets
+//  					the two indexes, carefully, in order,
+//  					after allocating)
+//  						- careful of multiprod/multicons
+//  						- nice that we alloc on demand
+//  						for created but unused UCQs
+//  						- would prob also not have a
+//  						spare page until needed, though
+//  						arguably that WILL happen after
+//  						we use it enough.
+//  					- need to detect during SENDING when
+//  					we're done with a page...
+//  						- which means we waste memory if
+//  						we never send again
+//  						- or a syscall from the user,
+//  						again...
+//  			OK, this might be useful
+//  				will need munmap to note the flag, and only
+//  				allow a kernel unmapper
+//  					and careful of shit like MAP_FIXED with
+//  					a do_mmap/kernel call
+//  				sort of like procdata, but free floating
+//
+// could do this:
+// - make the source arena be phys addrs.  have a helper with the dma_arena that
+// is the dma_addr->kernel_addr function.  
+// - if pci->dma_arena == NULL, just pull from the default
+// 	default is a kpages-converted-to-paddr, with a helper that is KADDR()
+// 	and it's a map_populate, for iofaults
+// - if user split mode, we have a fake arena that pulls with do_mmap
+// 	helper func is either uva2kva or we go with a "switch_to" model
+//
+// - what about pinning?
+// 	- iofaults
+// 	- deadlocks and whatnot if userspace unmaps our addrs
+// 	- KPFs in the driver, etc
+// 		that would need waserror or otherwise be careful
+// 		easy to fuck that up
+// 	- permanently mmap it?

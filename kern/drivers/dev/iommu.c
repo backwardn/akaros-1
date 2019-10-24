@@ -386,6 +386,7 @@ static bool assign_device(int bus, int dev, int func, pid_t pid)
 		spin_unlock_irqsave(&d->iommu->iommu_lock);
 		spin_unlock_irqsave(&p->proc_lock);
 		proc_decref(p);
+		// XXX no - assigned to d->proc_owner->pid...
 		error(EIO, "dev already assigned to pid = %d\n", p->pid);
 	}
 

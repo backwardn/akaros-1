@@ -494,6 +494,35 @@ static bool test_dma_pool(void)
 	return true;
 }
 
+// XXX  not final interface.  also need 'get my'?  (usually devices get it)
+extern void add_dma_arena(struct proc *p);
+extern void del_dma_arena(struct proc *p);
+#include <umem.h>
+
+static bool test_user_dma(void)
+{
+	struct dma_arena *da;
+	void *o1, *o2;
+	dma_addr_t d1, d2;
+
+	add_dma_arena(current);
+	da = current->user_pages;
+	o1 = dma_arena_alloc(da, PGSIZE * 4, &d1, MEM_WAIT);
+	o2 = dma_arena_alloc(da, PGSIZE, &d2, MEM_WAIT);
+
+	KT_ASSERT(is_user_rwaddr((void*)d1, PGSIZE * 4));
+	KT_ASSERT(is_user_rwaddr((void*)d2, PGSIZE));
+	KT_ASSERT(o1 == (void*)d1);
+	KT_ASSERT(o2 == (void*)d2);
+
+	dma_arena_free(da, o1, d1, PGSIZE * 4);
+	dma_arena_free(da, o2, d2, PGSIZE);
+
+	del_dma_arena(current);
+
+	return true;
+}
+
 static struct ktest ktests[] = {
 	KTEST_REG(nextfit,		CONFIG_KTEST_ARENA),
 	KTEST_REG(bestfit,		CONFIG_KTEST_ARENA),
@@ -513,6 +542,8 @@ static struct ktest ktests[] = {
 	KTEST_REG(accounting,		CONFIG_KTEST_ARENA),
 	KTEST_REG(self_source,		CONFIG_KTEST_ARENA),
 	KTEST_REG(dma_pool,		CONFIG_KTEST_ARENA),
+
+	KTEST_REG(user_dma,		CONFIG_KTEST_ARENA),
 };
 
 static int num_ktests = sizeof(ktests) / sizeof(struct ktest);

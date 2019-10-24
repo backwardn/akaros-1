@@ -22,6 +22,8 @@
 #include <ns.h>
 #include <arch/vmm/vmm.h>
 #include <arch/pci.h>
+// XXX pci.h couldn't include.  pulled in too much via arena->rb->rcu->cv
+#include <dma.h>
 
 TAILQ_HEAD(vcore_tailq, vcore);
 /* 'struct proc_list' declared in sched.h (not ideal...) */
@@ -121,6 +123,9 @@ struct proc {
 	struct strace		*strace;
 	struct pcidev_tq	pci_devices; /* for device passthru */
 	TAILQ_ENTRY(proc)	iommu_link;
+
+	// XXX
+	struct dma_arena	*user_pages;
 };
 
 /* Til we remove all Env references */

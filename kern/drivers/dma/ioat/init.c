@@ -16,6 +16,8 @@
  *
  */
 
+#define DEV_DBG 1
+
 #include <linux_compat.h>
 #include <linux/sizes.h>
 
@@ -439,17 +441,24 @@ int ioat_dma_setup_interrupts(struct ioatdma_device *ioat_dma)
 		irq_h = register_irq(0 /* ignored for msi(x)! */,
 				     ioat_dma_do_interrupt_msix, ioat_chan,
 				     pci_to_tbdf(pdev));
-		/* TODO: this is a mess - we also don't know if we're actually
-		 * MSIX or not!  We don't even know our vector... */
 		if (!irq_h) {
-			warn("MSIX failed (cnt %d), leaking vectors etc!", i);
+			warn("MSIX setup failed (cnt %d)!", i);
 			for (j = 0; j < i; j++) {
 				msix = &ioat_dma->msix_entries[j];
 				ioat_chan = ioat_chan_by_index(ioat_dma, j);
-				//devm_free_irq(dev, msix->vector, ioat_chan);
+				deregister_irq(msix->vector, pci_to_tbdf(pdev));
 			}
 			goto err_no_irq;
 		}
+		/* TODO: this is ugly.  Though really we need register_irq() to
+		 * not fallback on its own here.  This case here is when we did
+		 * get an irq_h, but it wasn't the type we wanted, and this
+		 * driver has different IRQ handlers for different types. */
+		if (strcmp("msi-x", irq_h->type)) {
+			warn("IRQ setup didn't get an MSIX!");
+			goto err_no_irq;
+		}
+		msix->vector = irq_h->apic_vector;
 	}
 	intrctrl |= IOAT_INTRCTRL_MSIX_VECTOR_CONTROL;
 	ioat_dma->irq_mode = IOAT_MSIX;
@@ -1459,26 +1468,6 @@ static int ioat_pci_probe(struct pci_device *pdev,
 	return 0;
 }
 
-/* In lieu of a decent PCI processing system... */
-static void __init ioat_init(void)
-{
-	struct pci_device *p;
-
-	STAILQ_FOREACH(p, &pci_devices, all_dev) {
-		if (p->ven_id != PCI_VENDOR_ID_INTEL)
-			continue;
-		for (int i = 0; ioat_pci_tbl[i].device; i++) {
-			if (p->dev_id == ioat_pci_tbl[i].device) {
-				ioat_pci_probe(p, &ioat_pci_tbl[i]);
-				break;
-			}
-		}
-	}
-}
-/* The 'arch_initcall' setup functions run at level 2. */
-init_func_3(ioat_init);
-
-#if 0 // AKAROS
 static void ioat_remove(struct pci_device *pdev)
 {
 	struct ioatdma_device *device = pci_get_drvdata(pdev);
@@ -1488,15 +1477,274 @@ static void ioat_remove(struct pci_device *pdev)
 
 	dev_err(&pdev->linux_dev, "Removing dma and dca services\n");
 	if (device->dca) {
+#if 0 // AKAROS
 		unregister_dca_provider(device->dca, &pdev->linux_dev);
 		free_dca_provider(device->dca);
+#else
+		warn("Unexpected dca on PCI %x:%x.%x", pdev->bus, pdev->dev,
+		     pdev->func);
+#endif
 		device->dca = NULL;
 	}
 
 	pci_disable_pcie_error_reporting(pdev);
 	ioat_dma_remove(device);
 }
-#endif
+
+/* TODO (DEVM): Akaros doesn't do the 'managed' part of devm_kzalloc and
+ * friends.  This helper will cleanup the things I noticed that were alloced
+ * in this manner.  This was made manually, so YMMV.
+ *
+ * Note that dmaengine.c has a dmam_device_release set up that calls
+ * dma_async_device_unregister, but this driver doesn't use the 'managed'
+ * dmaenginem_async_device_register(). */
+static void devm_cleanup(struct pci_device *pdev)
+{
+	struct ioatdma_device *ioat_dma = pci_get_drvdata(pdev);
+	struct ioatdma_chan *ioat_chan;
+
+	if (!ioat_dma)
+		return;
+	pci_set_drvdata(pdev, NULL);
+	for (int i = 0; i < IOAT_MAX_CHANS; i++) {
+		ioat_chan = ioat_dma->idx[i];
+		if (!ioat_chan)
+			continue;
+		kfree(ioat_chan);
+	}
+	kfree(ioat_dma);
+}
+
+/* TODO (DEVM): Akaros doesn't do any of the 'managed' pci/dev stuff, so we'll
+ * have to free things if probe fails. */
+static int ioat_pci_probe_wrapper(struct pci_device *pdev,
+				  const struct pci_device_id *id)
+{
+	int ret;
+
+	ret = ioat_pci_probe(pdev, id);
+	if (ret < 0) {
+		devm_cleanup(pdev);
+		/* Might be a bug in the linux driver, but there are error paths
+		 * that happen after BME is set. */
+		pci_clr_bus_master(pdev);
+	}
+	return ret;
+}
+
+/* In lieu of a decent PCI processing system... */
+static bool ioat_pci_init(struct pci_device *pdev)
+{
+	const struct pci_device_id *pci_id;
+
+	pci_id = srch_linux_pci_tbl(ioat_pci_tbl, pdev);
+	if (!pci_id)
+		return false;
+	if (ioat_pci_probe_wrapper(pdev, pci_id) < 0)
+		return false;
+	return true;
+}
+
+// XXX
+// 	here - sorting these issues.  might be OK now.
+//
+// 	OK, resetting...
+// 		ideally, devices wouldn't let 'reset' return until all
+// 		outstanding users are gone
+// 			meaning it needs to deregister to prevent new ones
+// 			wait for them all to finish
+// 			then wrap up
+// 			
+// 		intent of the qlock was so reset / init could block.
+// 			right now, there are two states.  maybe have more, like
+// 			RESETTING
+// 			INITIALIZING
+// 			etc
+// 			- basically using a spinlock on state, and having other
+// 			callers fail (EAGAIN) instead of blocking
+// 			- benefit of some state changers being able to just
+// 			spinlock, esp if there are multiple locks involved (lock
+// 			ordering from proc to device/iommu)
+//
+// 		what all is that spinlock used for?  assignment and whatnot?
+// 			set/clr pci bus master
+// 			not assignment - that is using the pdev->iommu->lock
+// 			- though it could be!  aren't using it for other shit
+// 			- tempted to use it for pci to proc assignment too
+// 				- make that a state?
+//
+// 		dma_async_device_unregister has some comments
+// 			claims dmaengine holds module references to prevent it
+// 			being called while channels are in use
+// 				- implying that use of dmaengine should up some
+// 				form of a ref (e.g. kernel module, but we'd have
+// 				to do something else)
+// 					- meaning, it's the caller's business
+// 					- dma_chan_get will do a module_get
+// 					- dma_chan_put does a module_put, under
+// 					the dma_list_mutex
+// 				- and implying the exit / reset should be called
+// 				on module unload, not at arbitrary times
+// 				- device_register() for each channel
+// 					these devices are dma_chan_dev, which
+// 					has an embedded struct device, but not a
+// 					pcidev or anything
+// 						that whole thing is about
+// 						connecting sysfs to the device
+// 				- device_unregister is called though, after the
+// 				chan->client_count check.
+// 					- since you're supposed to dma_chan_put
+// 					before unregistering.
+// 					- if the path is
+// 					attempt module unload?
+// 					dma_chan_put->module_unload->finally_module_unloaded->module_exit->pci_reset_method, then it'd make some sense
+// 					- note that pci_unregister_driver is
+// 					called when THIS module is unloaded
+// 						- which eventually calls their
+// 						remove() method
+// 					- also note that PCI does remove and
+// 					shutdown.  reset is my word here,
+// 					similar to 9ns
+//
+//				
+// 				- see __pci_reset_function_locked
+// 					caller holds the device mtx, and also
+// 					needs to make sure it is unused.
+// 					it also does a lot of HW resetting, incl
+// 					PCI config space and whatnot!
+// 					- hence our 'lighter' reset is weird
+// 					- i.e. not a full PCI reset, just a
+// 					driver reset
+// 					- there's other stuff they do, like
+// 					block cfg space access, disable
+// 					irq/mmio, etc
+// 					- pci_dev_specific_reset too: a quirk
+// 					table for devices, esp when given to
+// 					guests, but the kernel lacks a driver
+// 					for O(5) devices
+//
+// 				seems like we'll need to sort it out ourselves
+// 				- callers to dma-whatever need to block the
+// 				resetters.
+// 					- kref style for the modules, but we're
+// 					not fully unloading.  
+// 					- still need a 'stop people from coming
+// 					in, then wait til they are done, then
+// 					reset.'
+// 					- sounds like process syscalls
+//
+// 		OK, other than the initial "kernel use" reset, all future users
+// 		will be via a process, and we won't reset until the process is
+// 		dead.  equiv to all syscalls being done and resetting the core
+// 		when the process context is done/gone.
+// 			- so that's our 'make sure everyone is done'
+// 			- just need to only do this for certain devices
+// 			- and o/w make sure devices are not in use before making
+// 			them usable by a proc
+//
+// 			- still feel like i should have a safter way to do this.
+// 			or perhaps we need to know at boot time to *not* init
+// 			the device?  once its used for the kernel, it's used
+// 			forever.  sort of the converse of the proc dedication
+// 			model.  (once used by a proc, never used by the kernel)
+//
+// 				HERE.  prob just use the proc, and comment.
+// 				temp shit, right?  =P
+// 			
+//
+//
+//
+//
+//
+//
+//
+//
+//
+// 		this gets into issues of 'how do i assign'
+// 		and whether or not that assignment is anything other than the
+// 		IOAT-hokey-tester stuff.
+//
+// 		during assign, we want to init.  when the proc is done, reset.
+// 		but the default is the kernel has it.  so maybe take it from the
+// 		kernel first, etc.  maybe idempotent reset()s.  or an assignment
+// 		to 'user-usable', like the pci-stub
+//
+// 	any way for us to prevent resets from random PCI devices?  give it
+// 	something that isn't IOAT, and you're in trouble.  Similarly, if you
+// 	init the same thing twice, you're also screwed
+//
+// 	regarding resetting arbitrary pdevs, we needed to know a certain pdev
+// 	gets the correct function pointer tbl..., which is why probe attaches
+// 	funcs.  then you can only call the right PCI ops on the right pdev
+// 		it's less a problem with probe, since we either scan all devices
+// 		or just check the driver for a pci_id.
+//
+// 		slightly hacky, we could check for the pci_id, but that's still
+// 		nasty, since we need to know to call into ioat in the first
+// 		place.  goes back to the func ptrs.  so given device, call
+// 		reset.  at that point, might as well call probe too?  still need
+// 		to sort out the initial scan/lookup, incl external drivers, but
+// 		could keep the probe around as a 'reinit'.
+// 		need to scan to know if it is us still, or whateever).
+
+/* We have support to stop individual IRQs, but the device is still somewhat
+ * initialized from a PCI perspective.  It's not torn down completely:
+ *
+ * We do:
+ * - Turn off and free specific MSI-X vectors.
+ * - Deregister and free the IRQ handler
+ * - Clear bus master enabled
+ * We do not:
+ * - Tear down pci_msi stuff, which is managed by the PCI layer.  Like the msix
+ *   table, or the msix_ready flag
+ * - Tear down the BAR mmio mappings.  Those are managed by the PCI layer.
+ */
+static bool ioat_pci_reset(struct pci_device *pdev)
+{
+	struct ioatdma_device *ioat_dma = pci_get_drvdata(pdev);
+	int msixcnt = ioat_dma->dma_dev.chancnt;
+	struct msix_entry *msix;
+
+	ioat_shutdown(pdev);
+	ioat_remove(pdev);
+
+	/* Assuming MSIX, which is enforced elsewhere.
+	 *
+	 * In Linux, devm resources are freed in reverse order, so the IRQs are
+	 * freed before the channels are freed.
+	 *
+	 * I'm a little reluctant to do this in devm_cleanup, since probe
+	 * failures clean up their own IRQs already.  (Or at least warn if they
+	 * need to. */
+	for (int i = 0; i < msixcnt; i++) {
+		msix = &ioat_dma->msix_entries[i];
+		deregister_irq(msix->vector, pci_to_tbdf(pdev));
+	}
+	devm_cleanup(pdev);
+	pci_clr_bus_master(pdev);
+	return true;
+}
+
+static struct pci_ops ioat_pci_ops = {
+	.driver_name	= "ioat",
+	.init		= ioat_pci_init,
+	.reset		= ioat_pci_reset,
+};
+
+static void __init ioat_init(void)
+{
+	struct pci_device *p;
+	const struct pci_device_id *pci_id;
+
+	STAILQ_FOREACH(p, &pci_devices, all_dev) {
+		if (p->ven_id != PCI_VENDOR_ID_INTEL)
+			continue;
+		if (ioat_pci_init(p))
+			pci_set_ops(p, &ioat_pci_ops, PCI_STATE_INIT);
+	}
+}
+/* The 'arch_initcall' setup functions run at level 2. */
+init_func_3(ioat_init);
 
 static int __init ioat_init_module(void)
 {

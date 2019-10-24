@@ -250,9 +250,11 @@ void pci_init(void)
 				}
 				pcidev = kzmalloc(sizeof(struct pci_device),
 						  MEM_WAIT);
+				pcidev->state = PCI_STATE_UNKNOWN;
 				/* we don't need to lock it til we post the
 				 * pcidev to the list*/
 				spinlock_init_irqsave(&pcidev->lock);
+				qlock_init(&pcidev->qlock);
 				/* we only discover domain 0 during legacy
 				 * PCI enumeration */
 				pcidev->domain = 0;
@@ -826,4 +828,36 @@ void pci_clear_mwi(struct pci_device *dev)
 		cmd &= ~PCI_COMMAND_INVALIDATE;
 		pcidev_write16(dev, PCI_COMMAND, cmd);
 	}
+}
+
+/* Probably too clever. */
+#define pci_state_change(from, to, method)				\
+{									\
+	ERRSTACK(1);							\
+									\
+	qlock(&pdev->qlock);						\
+	if (waserror()) {						\
+		qunlock(&pdev->qlock);					\
+		nexterror();						\
+	}								\
+	if (pdev->state != (from))					\
+		error(EBUSY, "Dev %s was in state %d (want %d)", pdev->name, \
+		      pdev->state, (from));				\
+	assert(pdev->_ops);	/* state-aware drivers need to provide ops */ \
+	if (!pdev->_ops->method(pdev))					\
+		error(EFAIL, "Dev %s driver %s %s failed", pdev->name,	\
+		      pdev->_ops->driver_name, #method);		\
+	pdev->state = to;						\
+	qunlock(&pdev->qlock);						\
+	poperror();							\
+}
+
+void pci_reset_device(struct pci_device *pdev)
+{
+	pci_state_change(PCI_STATE_INIT, PCI_STATE_RESET, reset);
+}
+
+void pci_init_device(struct pci_device *pdev)
+{
+	pci_state_change(PCI_STATE_RESET, PCI_STATE_INIT, init);
 }
